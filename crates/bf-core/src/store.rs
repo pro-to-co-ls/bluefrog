@@ -29,6 +29,17 @@ pub struct Counts {
     pub downloaded: u32,
 }
 
+/// Aggregate swarm totals across every tracked torrent, sampled for the metrics gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Totals {
+    /// Torrents currently tracked.
+    pub torrents: u64,
+    /// Seeders (peers with the complete torrent) summed over all torrents.
+    pub seeders: u64,
+    /// Leechers (peers still downloading) summed over all torrents.
+    pub leechers: u64,
+}
+
 #[derive(Clone, Copy)]
 struct PeerVal {
     flags: u8,
@@ -189,6 +200,22 @@ impl Store {
     #[must_use]
     pub fn torrent_count(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
+    }
+
+    /// Aggregate torrent/seeder/leecher totals in a single pass over the store. O(torrents); meant
+    /// for the metrics endpoint, not the hot path.
+    #[must_use]
+    pub fn totals(&self) -> Totals {
+        let mut totals = Totals::default();
+        for shard in &self.shards {
+            let shard = shard.read();
+            totals.torrents += shard.len() as u64;
+            for t in shard.values() {
+                totals.seeders += (t.v4.seeders + t.v6.seeders) as u64;
+                totals.leechers += (t.v4.leechers() + t.v6.leechers()) as u64;
+            }
+        }
+        totals
     }
 
     /// Register/refresh an IPv4 peer and return the swarm counts plus, in `peers_out`, up to
@@ -454,6 +481,30 @@ mod tests {
         s.gc(10 + TORRENT_TIMEOUT_MINUTES);
         assert_eq!(s.torrent_count(), 1);
         assert_eq!(s.scrape(&H).downloaded, 1);
+    }
+
+    #[test]
+    fn totals_across_torrents() {
+        let s = Store::new();
+        let mut peers = Vec::new();
+        // torrent H: one v4 seeder + one v6 leecher
+        s.announce_v4(&H, K1, flag::SEEDING, 50, 10, &mut peers);
+        s.announce_v6(&H, [0u8; 18], flag::LEECHING, 50, 10, &mut peers);
+        // a second torrent: one v4 leecher
+        let h2: InfoHash = [8u8; HASH_LEN];
+        s.announce_v4(&h2, K2, flag::LEECHING, 50, 10, &mut peers);
+        let t = s.totals();
+        assert_eq!(
+            t,
+            Totals {
+                torrents: 2,
+                seeders: 1,
+                leechers: 2
+            }
+        );
+        // an empty store is all zeros; also exercises the derives
+        assert_eq!(Store::new().totals(), Totals::default());
+        assert!(format!("{t:?}").contains("Totals"));
     }
 
     #[test]

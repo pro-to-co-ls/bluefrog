@@ -215,8 +215,11 @@ async fn serve_metrics(listener: TcpListener, sh: Arc<Shared>) {
             let service = service_fn(move |_req: Request<Incoming>| {
                 let sh = sh.clone();
                 async move {
+                    let totals = sh.store.totals();
                     let gauges = Gauges {
-                        torrents: sh.store.torrent_count() as u64,
+                        torrents: totals.torrents,
+                        seeders: totals.seeders,
+                        leechers: totals.leechers,
                         l7_tracked: sh.detector.tracked() as u64,
                     };
                     Ok::<_, Infallible>(http_reply(

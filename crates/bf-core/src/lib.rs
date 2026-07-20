@@ -7,7 +7,7 @@ pub mod connid;
 pub mod store;
 
 pub use connid::ConnId;
-pub use store::{Counts, Store};
+pub use store::{Counts, Store, Totals};
 
 /// Length of a BitTorrent info-hash or peer-id (SHA-1), in bytes.
 pub const HASH_LEN: usize = 20;
