@@ -9,22 +9,44 @@ permissions:
 
 jobs:
   release:
-    name: build & publish release binary
-    runs-on: ubuntu-latest
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+
+      # rustables builds its netlink bindings with bindgen (needs libclang).
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Install Rust 1.97.1
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
-      # Activates once the `bluefrog` binary crate exists (milestone M-ops). Builds the release
-      # binary, packages it, and attaches it (plus checksums) to the GitHub release for the tag.
-      - name: Build & upload
-        uses: taiki-e/upload-rust-binary-action@v1
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p bluefrog
+
+      - name: Package
+        run: |
+          bin="target/${{ matrix.target }}/release/bluefrog"
+          name="bluefrog-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          tar -C "$(dirname "$bin")" -czf "$name.tar.gz" bluefrog
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      # softprops creates the release for the tag if it doesn't exist, then uploads the assets —
+      # each matrix job adds its own arch's files to the same release.
+      - name: Publish to the GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          bin: bluefrog
-          target: x86_64-unknown-linux-gnu
-          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            bluefrog-*.tar.gz
+            bluefrog-*.tar.gz.sha256

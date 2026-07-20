@@ -317,9 +317,12 @@ async fn wait_for_shutdown() {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/etc/bluefrog/bluefrog.conf".to_string());
+    let arg = std::env::args().nth(1);
+    if matches!(arg.as_deref(), Some("--version" | "-V")) {
+        println!("bluefrog {}", env!("BLUEFROG_VERSION"));
+        return Ok(());
+    }
+    let path = arg.unwrap_or_else(|| "/etc/bluefrog/bluefrog.conf".to_string());
     let text = std::fs::read_to_string(&path)?;
     let config = bf_config::parse(&text).map_err(|e| {
         std::io::Error::new(
