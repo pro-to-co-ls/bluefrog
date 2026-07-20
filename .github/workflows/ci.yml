@@ -20,7 +20,7 @@ jobs:
     name: fmt · clippy · test · coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rustables builds its netlink bindings with bindgen (needs libclang + kernel headers).
       # The runner is Linux, so this is where the native nft sink is actually compiled and linted.
