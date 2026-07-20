@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # All Cargo dependency bumps arrive as a single grouped weekly PR.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # All GitHub Actions bumps arrive as a single grouped weekly PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

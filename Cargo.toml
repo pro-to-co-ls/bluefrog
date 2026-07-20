@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bf-core",
+    "crates/bf-proto",
+    "crates/bf-udp",
+    "crates/bf-http",
+    "crates/bf-l7",
+    "crates/bf-config",
+    "crates/bf-metrics",
+    "crates/bf-nft",
+    "crates/bluefrog",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/pro-to-co-ls/bluefrog"
+authors = ["protocols"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

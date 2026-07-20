@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustables builds its netlink bindings with bindgen (needs libclang + kernel headers).
+      # The runner is Linux, so this is where the native nft sink is actually compiled and linted.
+      - name: Install system deps (libclang for rustables bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Excluded from the 100%-line gate: the `bluefrog` binary (socket/runtime glue, covered by its
+      # integration test) and `bf-nft/src/sink.rs` (the Linux-only netlink sink, which needs root +
+      # a real nftables set to exercise). Both are still compiled and clippy-linted above on Linux.
+      - name: Test + coverage (100% line coverage of the library crates)
+        run: >
+          cargo llvm-cov --workspace --all-features
+          --ignore-filename-regex 'crates/bluefrog/|crates/bf-nft/src/sink.rs'
+          --lcov --output-path lcov.info
+          --fail-under-lines 100
+
+      # The `--fail-under-lines 100` gate above is the hard enforcement; Coveralls just hosts the
+      # badge and history. Runs even if the gate fails so a coverage drop is still visible.
+      - name: Upload coverage to Coveralls
+        if: always()
+        uses: coverallsapp/github-action@v2
+        with:
+          file: lcov.info
+          format: lcov

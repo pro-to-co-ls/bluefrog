@@ -1,0 +1,16 @@
+[package]
+name = "bf-nft"
+description = "bluefrog nft ban-command construction (auto-expiring set elements)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+# nftables over netlink is Linux-only; on other targets the sink is a stub so the workspace still
+# builds/tests on a dev host. Production targets are linux arm64 + amd64.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustables = "0.8"

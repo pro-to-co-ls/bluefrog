@@ -1,0 +1,32 @@
+[Unit]
+Description=bluefrog BitTorrent tracker
+Documentation=https://github.com/pro-to-co-ls/bluefrog
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/bluefrog /etc/bluefrog/bluefrog.conf
+Restart=on-failure
+RestartSec=2
+
+# Run unprivileged. The only capability needed is CAP_NET_ADMIN, so the L7 layer can add
+# elements to the nft ban sets (l7ban4/l7ban6). Nothing else is granted.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Sandboxing.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

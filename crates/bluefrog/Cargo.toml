@@ -1,0 +1,40 @@
+[package]
+name = "bluefrog"
+description = "bluefrog tracker daemon (tokio UDP hot path + hyper HTTP + L7/nft)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "bluefrog"
+path = "src/main.rs"
+
+[dependencies]
+bf-core = { path = "../bf-core" }
+bf-proto = { path = "../bf-proto" }
+bf-udp = { path = "../bf-udp" }
+bf-http = { path = "../bf-http" }
+bf-l7 = { path = "../bf-l7" }
+bf-config = { path = "../bf-config" }
+bf-metrics = { path = "../bf-metrics" }
+bf-nft = { path = "../bf-nft" }
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "macros",
+    "signal",
+    "time",
+    "io-util",
+] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+socket2 = { version = "0.5", features = ["all"] }
+fastrand = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }

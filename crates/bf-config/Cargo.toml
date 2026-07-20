@@ -1,0 +1,12 @@
+[package]
+name = "bf-config"
+description = "bluefrog config parser (line-based directive format + l7/nft/metrics)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bf-l7 = { path = "../bf-l7" }

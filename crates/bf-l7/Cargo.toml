@@ -1,0 +1,13 @@
+[package]
+name = "bf-l7"
+description = "bluefrog L7 behavioral abuse detection (re-announce interval, connid, peer_id)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bf-core = { path = "../bf-core" }
+parking_lot = "0.12"

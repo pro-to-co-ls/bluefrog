@@ -1,0 +1,42 @@
+# bluefrog config. Directives are `section.key value`; `#` comments and blank lines are ignored;
+# unrecognised directives are parsed and ignored.
+
+# --- listen ---------------------------------------------------------------------------------
+# UDP is the tracker; HTTP is optional. Use [::] for dual-stack.
+listen.udp [::]:2710
+listen.tcp [::]:27108
+listen.udp.workers 16          # SO_REUSEPORT sockets/tasks (default: 1)
+listen.udp.rcvbuf 8388608      # SO_RCVBUF per UDP socket
+
+# --- tracker --------------------------------------------------------------------------------
+tracker.redirect_url https://example.com/
+tracker.rootdir /etc/bluefrog
+# tracker.user nobody
+
+# connection_id key window (seconds). 120 = BEP-15-compliant, tighter anti-replay (default).
+udp.connid_window 120
+
+# stats/monitoring source allowlist (raw nets; matched by the runtime)
+access.stats 127.0.0.0/8
+
+# --- L7 client checks -----------------------------------------------------------------------
+l7.enable 1
+l7.reannounce_min_interval 60  # same-torrent re-announce faster than this = a violation
+l7.score_ban_threshold 100
+l7.ban_duration 3600           # informational; expiry is the nft set's default timeout
+l7.max_entries 2000000         # memory bound on tracked sources
+
+# --- nft enforcement (native netlink; auto-expiring ban sets) ------------------------------
+# Bans are written directly over netlink (no process spawn); needs CAP_NET_ADMIN (see
+# deploy/bluefrog.service). Define the sets with a default `timeout` (elements inherit it and
+# self-expire) and drop them early, e.g.:
+#   set l7ban4 { type ipv4_addr; flags timeout; timeout 1h; }
+#   set l7ban6 { type ipv6_addr; flags timeout; timeout 1h; }
+#   ... ip saddr @l7ban4 drop ; ip6 saddr @l7ban6 drop
+nft.enable 1
+nft.table inet filter
+nft.set4 l7ban4
+nft.set6 l7ban6
+
+# --- observability --------------------------------------------------------------------------
+metrics.listen 127.0.0.1:9100  # Prometheus/OpenMetrics endpoint
