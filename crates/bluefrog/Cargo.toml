@@ -33,7 +33,7 @@ tokio = { version = "1", features = [
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 fastrand = "2"
 
 [dev-dependencies]
