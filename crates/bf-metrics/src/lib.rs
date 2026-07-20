@@ -1,8 +1,8 @@
 //! Prometheus/OpenMetrics counters and text exposition.
 //!
 //! Lock-free atomic counters incremented on the hot path; [`Metrics::render`] produces the text
-//! exposition format the runtime serves on the metrics endpoint. Gauges (torrents, tracked
-//! sources) are sampled at render time and passed in. Pure — no I/O.
+//! exposition format the runtime serves on the metrics endpoint. Gauges (torrents, seeders,
+//! leechers, tracked sources) are sampled at render time and passed in. Pure — no I/O.
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +66,10 @@ pub enum Counter {
 pub struct Gauges {
     /// Torrents currently tracked.
     pub torrents: u64,
+    /// Seeders (complete peers) across all torrents.
+    pub seeders: u64,
+    /// Leechers (downloading peers) across all torrents.
+    pub leechers: u64,
     /// L7 sources currently tracked.
     pub l7_tracked: u64,
 }
@@ -121,6 +125,8 @@ impl Metrics {
         }
         for (name, v) in [
             ("bf_torrents", gauges.torrents),
+            ("bf_seeders", gauges.seeders),
+            ("bf_leechers", gauges.leechers),
             ("bf_l7_tracked_sources", gauges.l7_tracked),
         ] {
             out.push_str(&format!("# TYPE {name} gauge\n{name} {v}\n"));
@@ -141,11 +147,15 @@ mod tests {
         m.inc(Counter::L7Ban);
         let text = m.render(Gauges {
             torrents: 42,
+            seeders: 30,
+            leechers: 12,
             l7_tracked: 7,
         });
         assert!(text.contains("# TYPE bf_udp_announces_total counter\nbf_udp_announces_total 2\n"));
         assert!(text.contains("bf_l7_bans_total 1\n"));
         assert!(text.contains("# TYPE bf_torrents gauge\nbf_torrents 42\n"));
+        assert!(text.contains("# TYPE bf_seeders gauge\nbf_seeders 30\n"));
+        assert!(text.contains("bf_leechers 12\n"));
         assert!(text.contains("bf_l7_tracked_sources 7\n"));
     }
 
@@ -179,6 +189,8 @@ mod tests {
             g,
             Gauges {
                 torrents: 0,
+                seeders: 0,
+                leechers: 0,
                 l7_tracked: 0
             }
         );
