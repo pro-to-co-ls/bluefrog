@@ -16,9 +16,6 @@ tracker.rootdir /etc/bluefrog
 # connection_id key window (seconds). 120 = BEP-15-compliant, tighter anti-replay (default).
 udp.connid_window 120
 
-# stats/monitoring source allowlist (raw nets; matched by the runtime)
-access.stats 127.0.0.0/8
-
 # --- L7 client checks -----------------------------------------------------------------------
 l7.enable 1
 l7.reannounce_min_interval 60  # same-torrent re-announce faster than this = a violation
@@ -39,4 +36,4 @@ nft.set4 l7ban4
 nft.set6 l7ban6
 
 # --- observability --------------------------------------------------------------------------
-metrics.listen 127.0.0.1:9100  # Prometheus/OpenMetrics endpoint
+metrics.listen 127.0.0.1:9100  # Prometheus/OpenMetrics endpoint (served to loopback only)

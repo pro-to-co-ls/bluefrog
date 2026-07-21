@@ -30,8 +30,6 @@ pub struct Config {
     pub rootdir: Option<String>,
     /// setuid target user.
     pub user: Option<String>,
-    /// Networks allowed to reach the stats/monitoring path (raw strings; runtime matches them).
-    pub stats_allow: Vec<String>,
     /// Prometheus metrics listen socket.
     pub metrics_listen: Option<SocketAddr>,
     /// Whether the L7 detector is enabled.
@@ -59,7 +57,6 @@ impl Default for Config {
             redirect_url: None,
             rootdir: None,
             user: None,
-            stats_allow: Vec::new(),
             metrics_listen: None,
             l7_enable: false,
             l7: bf_l7::Config::default(),
@@ -142,7 +139,6 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
             "tracker.redirect_url" => c.redirect_url = Some(val.to_string()),
             "tracker.rootdir" => c.rootdir = Some(val.to_string()),
             "tracker.user" => c.user = Some(val.to_string()),
-            "access.stats" => c.stats_allow.push(val.to_string()),
             "metrics.listen" => c.metrics_listen = Some(field(val, line)?),
             "l7.enable" => c.l7_enable = boolean(val, line)?,
             "l7.reannounce_min_interval" => c.l7.reannounce_min_interval = field(val, line)?,
@@ -190,7 +186,7 @@ tracker.redirect_url https://example.com/
         assert_eq!(c.udp_rcvbuf, Some(8_388_608));
         assert_eq!(c.tcp_listen, vec!["[::]:27108".parse().unwrap()]);
         assert_eq!(c.udp_listen, vec!["[::]:2710".parse().unwrap()]);
-        assert_eq!(c.stats_allow, vec!["127.0.0.0/8".to_string()]);
+        // `access.stats` is now an ignored directive (localhost-only metrics is enforced in code).
         assert_eq!(c.rootdir.as_deref(), Some("/etc/bluefrog"));
         assert_eq!(c.redirect_url.as_deref(), Some("https://example.com/"));
     }

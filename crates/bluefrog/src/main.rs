@@ -71,7 +71,11 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
 }
 
 fn random_key() -> [u8; 32] {
-    std::array::from_fn(|_| fastrand::u8(..))
+    // The connid MAC key is the anti-spoofing root of trust — it must come from the OS CSPRNG,
+    // never a non-cryptographic PRNG.
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).expect("OS CSPRNG unavailable");
+    key
 }
 
 fn bind_reuseport_udp(addr: SocketAddr, rcvbuf: Option<usize>) -> std::io::Result<UdpSocket> {
@@ -91,27 +95,41 @@ fn bind_reuseport_udp(addr: SocketAddr, rcvbuf: Option<usize>) -> std::io::Resul
     UdpSocket::from_std(sock.into())
 }
 
-/// Feed the L7 detector from the datagram and the handler's verdict on it.
-fn feed_l7(sh: &Shared, req: &[u8], ip16: &[u8; 16], action: &Action, now_min: u32) -> Verdict {
+/// Feed the L7 detector from the pre-parsed request and the handler's verdict. `now_secs` is the
+/// current time in seconds (the L7 clock).
+fn feed_l7(
+    sh: &Shared,
+    parsed: &Result<udp::Request, udp::ParseError>,
+    ip16: &[u8; 16],
+    action: &Action,
+    now_secs: u32,
+) -> Verdict {
     if matches!(action, Action::ConnidMismatch) {
-        return sh.detector.on_connid_mismatch(ip16, now_min);
+        return sh.detector.on_connid_mismatch(ip16, now_secs);
     }
-    if let Ok(udp::Request::Announce(a)) = udp::parse(req) {
+    if let Ok(udp::Request::Announce(a)) = parsed {
         return sh
             .detector
-            .on_announce(ip16, a.info_hash, a.peer_id, now_min);
+            .on_announce(ip16, a.info_hash, a.peer_id, now_secs);
     }
     Verdict::Allow
 }
 
-/// Ban a source IP by adding it to the nft set over netlink (native, no process spawn).
-fn ban(sh: &Shared, ip: IpAddr, duration: u32) {
-    if sh.sink.ban(ip, duration).is_err() {
-        sh.metrics.inc(Counter::NftError);
-    }
+/// Ban a source IP by adding it to the nft set over netlink. Runs on the blocking pool so the
+/// netlink syscall never stalls the async worker.
+fn ban(sh: Arc<Shared>, ip: IpAddr, duration: u32) {
+    tokio::task::spawn_blocking(move || {
+        if sh.sink.ban(ip, duration).is_err() {
+            sh.metrics.inc(Counter::NftError);
+        }
+    });
 }
 
-fn record_udp_metric(metrics: &Metrics, req: &[u8], action: &Action) {
+fn record_udp_metric(
+    metrics: &Metrics,
+    parsed: &Result<udp::Request, udp::ParseError>,
+    action: &Action,
+) {
     match action {
         Action::Drop => {
             metrics.inc(Counter::UdpDropped);
@@ -123,7 +141,7 @@ fn record_udp_metric(metrics: &Metrics, req: &[u8], action: &Action) {
         }
         Action::Reply(_) => {}
     }
-    match udp::parse(req) {
+    match parsed {
         Ok(udp::Request::Connect { .. }) => metrics.inc(Counter::UdpConnect),
         Ok(udp::Request::Announce(_)) => metrics.inc(Counter::UdpAnnounce),
         Ok(udp::Request::Scrape(_)) => metrics.inc(Counter::UdpScrape),
@@ -143,17 +161,21 @@ async fn udp_worker(sock: UdpSocket, sh: Arc<Shared>) {
         let is_v4 = ip.is_ipv4();
         let now = sh.clock.load(Ordering::Relaxed);
         let interval = 1620 + fastrand::u32(0..360);
+        // Parse once and share it with the metric counter and the L7 feed.
+        let parsed = udp::parse(&buf[..n]);
         let action = sh
             .udp
             .handle(&buf[..n], &ip16, is_v4, now, interval, &mut out);
 
-        record_udp_metric(&sh.metrics, &buf[..n], &action);
+        record_udp_metric(&sh.metrics, &parsed, &action);
         if sh.config.l7_enable {
-            let now_min = u32::try_from(now / 60).unwrap_or(u32::MAX);
-            if let Verdict::Ban { duration } = feed_l7(&sh, &buf[..n], &ip16, &action, now_min) {
+            // The L7 detector runs on a seconds clock (its `reannounce_min_interval` /
+            // `decay_per_sec` are in seconds), unlike the store's minutes clock.
+            let now_secs = u32::try_from(now).unwrap_or(u32::MAX);
+            if let Verdict::Ban { duration } = feed_l7(&sh, &parsed, &ip16, &action, now_secs) {
                 sh.metrics.inc(Counter::L7Ban);
                 if sh.config.nft_enable {
-                    ban(&sh, ip, duration);
+                    ban(sh.clone(), ip, duration);
                 }
             }
         }
@@ -225,9 +247,12 @@ async fn serve_http(listener: TcpListener, sh: Arc<Shared>) {
 
 async fn serve_metrics(listener: TcpListener, sh: Arc<Shared>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer)) = listener.accept().await else {
             continue;
         };
+        if !peer.ip().is_loopback() {
+            continue; // metrics are localhost-only; access is not otherwise gated
+        }
         let sh = sh.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -324,11 +349,14 @@ async fn run(config: bf_config::Config) -> std::io::Result<()> {
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
         }
     }
     #[cfg(not(unix))]

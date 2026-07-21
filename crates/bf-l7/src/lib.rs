@@ -179,7 +179,8 @@ impl Detector {
         client
     }
 
-    /// Feed an announce. Raises the score on interval abuse and unknown peer_ids.
+    /// Feed an announce. Raises the score on interval abuse and unknown peer_ids. `now` is in
+    /// **seconds** — the same unit as [`Config::reannounce_min_interval`] and `decay_per_sec`.
     pub fn on_announce(
         &self,
         ip: &Ip,
@@ -198,7 +199,8 @@ impl Detector {
         self.verdict(client)
     }
 
-    /// Feed a connection-id mismatch (a UDP announce/scrape whose connid failed validation).
+    /// Feed a connection-id mismatch (a UDP announce/scrape whose connid failed validation). `now`
+    /// is in **seconds** (see [`Detector::on_announce`]).
     pub fn on_connid_mismatch(&self, ip: &Ip, now: u32) -> Verdict {
         let mut shard = self.shard(ip).lock();
         let client = self.touch(&mut shard, ip, now);
