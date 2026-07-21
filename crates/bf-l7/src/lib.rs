@@ -109,6 +109,12 @@ pub struct Config {
     pub weight_scrape_volume: u32,
     /// Info-hash count at or above which a scrape counts as bulk enumeration.
     pub scrape_volume_threshold: usize,
+    /// Score added once a source has been issued [`Config::connect_burst`] connection ids without
+    /// ever using one.
+    pub weight_connect_spam: u32,
+    /// Unanswered connects tolerated before a source is treated as connect spam. A conforming
+    /// client needs one per connid window, plus a few for datagrams lost in flight.
+    pub connect_burst: u32,
     /// Cap on remembered offenders (the escalation registry).
     pub max_offenders: usize,
     /// Number of escalation tiers; tier `0` is the first offence.
@@ -138,6 +144,8 @@ impl Default for Config {
             breadth_threshold: 32,
             weight_scrape_volume: 15,
             scrape_volume_threshold: 32,
+            weight_connect_spam: 25,
+            connect_burst: 8,
             max_offenders: 100_000,
             ban_tiers: 3,
         }
@@ -175,6 +183,8 @@ struct Client {
     banned: bool,
     /// Bitmap fingerprint of the distinct torrents this source has touched.
     breadth: u64,
+    /// Connection ids issued to this source that it has not yet used.
+    connects: u32,
     ring: [Option<Seen>; RING],
     ring_pos: usize,
 }
@@ -201,6 +211,7 @@ impl Client {
             last_seen: now,
             banned: false,
             breadth: 0,
+            connects: 0,
             ring: [None; RING],
             ring_pos: 0,
         }
@@ -380,6 +391,8 @@ impl Detector {
         let ban = {
             let mut shard = self.shard(ip).lock();
             let client = self.touch(&mut shard, ip, now);
+            // Getting here means the client used a connection id it was issued.
+            client.connects = 0;
             let (interval, key_churn, peer_churn) =
                 client.observe(a, now, self.config.reannounce_min_interval, peer);
             let mut add = stateless;
@@ -424,10 +437,29 @@ impl Detector {
         let ban = {
             let mut shard = self.shard(ip).lock();
             let client = self.touch(&mut shard, ip, now);
+            client.connects = 0; // the handshake was followed through
             if hashes >= self.config.scrape_volume_threshold {
                 client.score = client
                     .score
                     .saturating_add(self.config.weight_scrape_volume);
+            }
+            self.crosses(client)
+        };
+        self.decide(ip, ban, now)
+    }
+
+    /// Feed a `connect`. BEP-15 issues a connection id that a conforming client then *uses*: one
+    /// connect is followed by announces or scrapes for the life of that id. A source that keeps
+    /// asking for ids and never uses one is connect spam — the cheapest packet to forge, and
+    /// invisible to every other signal here because a connect carries no info-hash, peer_id or
+    /// key to inspect. `now` is in **seconds**.
+    pub fn on_connect(&self, ip: &Ip, now: u32) -> Verdict {
+        let ban = {
+            let mut shard = self.shard(ip).lock();
+            let client = self.touch(&mut shard, ip, now);
+            client.connects = client.connects.saturating_add(1);
+            if client.connects > self.config.connect_burst {
+                client.score = client.score.saturating_add(self.config.weight_connect_spam);
             }
             self.crosses(client)
         };
@@ -830,6 +862,41 @@ mod tests {
         d.on_announce(&a, &clean(&H1, &GOOD_PEER), 1000);
         d.on_announce(&b, &clean(&H1, &GOOD_PEER), 1001);
         assert_eq!(d.tracked(), 1);
+    }
+
+    #[test]
+    fn connect_spam_scores_without_follow_through() {
+        let d = Detector::new(Config {
+            weight_connect_spam: 100,
+            connect_burst: 3,
+            ..quiet()
+        });
+        // a few unanswered connects are free: a lost announce legitimately causes a re-connect
+        for _ in 0..3 {
+            assert_eq!(d.on_connect(&IP, 1000), Verdict::Allow);
+        }
+        // but asking for ids and never using one is spam
+        assert!(matches!(d.on_connect(&IP, 1000), Verdict::Ban { .. }));
+    }
+
+    #[test]
+    fn using_the_connection_id_clears_connect_suspicion() {
+        let d = Detector::new(Config {
+            weight_connect_spam: 100,
+            connect_burst: 3,
+            ..quiet()
+        });
+        for _ in 0..3 {
+            d.on_connect(&IP, 1000);
+        }
+        // an announce proves the handshake was used, so the tally resets
+        d.on_announce(&IP, &clean(&H1, &GOOD_PEER), 1000);
+        for _ in 0..3 {
+            assert_eq!(d.on_connect(&IP, 1000), Verdict::Allow);
+        }
+        // a scrape counts as follow-through too
+        d.on_scrape(&IP, 1, 1000);
+        assert_eq!(d.on_connect(&IP, 1000), Verdict::Allow);
     }
 
     #[test]

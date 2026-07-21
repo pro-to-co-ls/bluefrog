@@ -150,7 +150,8 @@ fn feed_l7(
             sh.detector
                 .on_scrape(ip16, s.iter_hashes().count(), now_secs)
         }
-        _ => Verdict::Allow,
+        Ok(udp::Request::Connect { .. }) => sh.detector.on_connect(ip16, now_secs),
+        Err(_) => Verdict::Allow,
     }
 }
 
