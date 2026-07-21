@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub const NUMWANT_MAX: usize = 200;
 /// Default numwant when the client omits it.
 pub const NUMWANT_DEFAULT: usize = 50;
+/// Maximum info-hashes honoured in a single HTTP scrape (matches the UDP cap).
+pub const MAX_SCRAPE_HASHES: usize = 75;
 
 /// A tracker HTTP response (the runtime maps these onto status codes).
 #[derive(Debug, PartialEq, Eq)]
@@ -131,7 +133,7 @@ impl HttpHandler {
                     Ok(p) => port = Some(p),
                     Err(_) => return Response::BadRequest,
                 },
-                "left" => left = raw.parse().unwrap_or(0),
+                "left" => left = raw.parse().unwrap_or(1), // malformed -> leecher, not seeder
                 "event" => event = raw,
                 "compact" => {
                     if raw == "0" {
@@ -202,6 +204,9 @@ impl HttpHandler {
         let mut buf = Vec::new();
         for (key, raw) in query_pairs(query) {
             if key == "info_hash" {
+                if files.len() >= MAX_SCRAPE_HASHES {
+                    break;
+                }
                 buf.clear();
                 if !percent_decode(raw.as_bytes(), &mut buf) || buf.len() != HASH_LEN {
                     return Response::BadRequest;
@@ -390,6 +395,24 @@ mod tests {
         assert_eq!(
             h.handle("/scrape?info_hash=x", &V4_IP, true, 10, 1800),
             Response::BadRequest
+        );
+    }
+
+    #[test]
+    fn scrape_caps_hash_count() {
+        let h = handler();
+        // a scrape carrying more than the cap of info_hash params
+        let mut q = String::from("/scrape?info_hash=");
+        q.push_str(IH);
+        for _ in 0..(MAX_SCRAPE_HASHES + 3) {
+            q.push_str("&info_hash=");
+            q.push_str(IH);
+        }
+        let text = body(h.handle(&q, &V4_IP, true, 10, 1800));
+        // only MAX_SCRAPE_HASHES entries are emitted, not the MAX+4 requested
+        assert_eq!(
+            text.matches("20:AAAAAAAAAAAAAAAAAAAA").count(),
+            MAX_SCRAPE_HASHES
         );
     }
 
