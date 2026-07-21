@@ -8,7 +8,7 @@
 
 use bf_core::{ConnId, Store};
 use bf_http::{HttpHandler, Response as HttpResponse};
-use bf_l7::{Detector, Verdict};
+use bf_l7::{AnnounceInfo, Detector, Verdict};
 use bf_metrics::{Counter, Gauges, Metrics};
 use bf_nft::{BanSink, NetlinkSink};
 use bf_proto::udp;
@@ -95,11 +95,34 @@ fn bind_reuseport_udp(addr: SocketAddr, rcvbuf: Option<usize>) -> std::io::Resul
     UdpSocket::from_std(sock.into())
 }
 
+/// Whether an address is publicly routable. BEP-15's `IP` field is only a legitimate NAT hint from
+/// private space, so this decides whether a client setting it is suspicious.
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation())
+        }
+        IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (head & 0xfe00) == 0xfc00   // unique-local fc00::/7
+                || (head & 0xffc0) == 0xfe80) // link-local fe80::/10
+        }
+    }
+}
+
 /// Feed the L7 detector from the pre-parsed request and the handler's verdict. `now_secs` is the
 /// current time in seconds (the L7 clock).
 fn feed_l7(
     sh: &Shared,
     parsed: &Result<udp::Request, udp::ParseError>,
+    ip: IpAddr,
     ip16: &[u8; 16],
     action: &Action,
     now_secs: u32,
@@ -107,19 +130,35 @@ fn feed_l7(
     if matches!(action, Action::ConnidMismatch) {
         return sh.detector.on_connid_mismatch(ip16, now_secs);
     }
-    if let Ok(udp::Request::Announce(a)) = parsed {
-        return sh
-            .detector
-            .on_announce(ip16, a.info_hash, a.peer_id, now_secs);
+    match parsed {
+        Ok(udp::Request::Announce(a)) => {
+            let info = AnnounceInfo {
+                info_hash: a.info_hash,
+                peer_id: a.peer_id,
+                key: a.key,
+                declared_ip: a.declared_ip,
+                port: a.port,
+                left: a.left,
+                downloaded: a.downloaded,
+                uploaded: a.uploaded,
+                num_want: a.num_want,
+                source_is_public: is_public(ip),
+            };
+            sh.detector.on_announce(ip16, &info, now_secs)
+        }
+        Ok(udp::Request::Scrape(s)) => {
+            sh.detector
+                .on_scrape(ip16, s.iter_hashes().count(), now_secs)
+        }
+        _ => Verdict::Allow,
     }
-    Verdict::Allow
 }
 
-/// Ban a source IP by adding it to the nft set over netlink. Runs on the blocking pool so the
-/// netlink syscall never stalls the async worker.
-fn ban(sh: Arc<Shared>, ip: IpAddr, duration: u32) {
+/// Ban a source IP by adding it to the nft set for its escalation `tier`. Runs on the blocking
+/// pool so the netlink syscall never stalls the async worker.
+fn ban(sh: Arc<Shared>, ip: IpAddr, tier: usize, duration: u32) {
     tokio::task::spawn_blocking(move || {
-        if sh.sink.ban(ip, duration).is_err() {
+        if sh.sink.ban(ip, tier, duration).is_err() {
             sh.metrics.inc(Counter::NftError);
         }
     });
@@ -172,10 +211,12 @@ async fn udp_worker(sock: UdpSocket, sh: Arc<Shared>) {
             // The L7 detector runs on a seconds clock (its `reannounce_min_interval` /
             // `decay_per_sec` are in seconds), unlike the store's minutes clock.
             let now_secs = u32::try_from(now).unwrap_or(u32::MAX);
-            if let Verdict::Ban { duration } = feed_l7(&sh, &parsed, &ip16, &action, now_secs) {
+            if let Verdict::Ban { duration, tier } =
+                feed_l7(&sh, &parsed, ip, &ip16, &action, now_secs)
+            {
                 sh.metrics.inc(Counter::L7Ban);
                 if sh.config.nft_enable {
-                    ban(sh.clone(), ip, duration);
+                    ban(sh.clone(), ip, tier as usize, duration);
                 }
             }
         }
@@ -265,6 +306,7 @@ async fn serve_metrics(listener: TcpListener, sh: Arc<Shared>) {
                         seeders: totals.seeders,
                         leechers: totals.leechers,
                         l7_tracked: sh.detector.tracked() as u64,
+                        l7_offenders: sh.detector.offenders() as u64,
                     };
                     Ok::<_, Infallible>(http_reply(
                         StatusCode::OK,

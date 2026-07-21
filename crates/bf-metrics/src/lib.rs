@@ -72,6 +72,8 @@ pub struct Gauges {
     pub leechers: u64,
     /// L7 sources currently tracked.
     pub l7_tracked: u64,
+    /// Sources in the L7 escalation registry (repeat offenders).
+    pub l7_offenders: u64,
 }
 
 impl Metrics {
@@ -128,6 +130,7 @@ impl Metrics {
             ("bf_seeders", gauges.seeders),
             ("bf_leechers", gauges.leechers),
             ("bf_l7_tracked_sources", gauges.l7_tracked),
+            ("bf_l7_offenders", gauges.l7_offenders),
         ] {
             out.push_str(&format!("# TYPE {name} gauge\n{name} {v}\n"));
         }
@@ -150,6 +153,7 @@ mod tests {
             seeders: 30,
             leechers: 12,
             l7_tracked: 7,
+            l7_offenders: 3,
         });
         assert!(text.contains("# TYPE bf_udp_announces_total counter\nbf_udp_announces_total 2\n"));
         assert!(text.contains("bf_l7_bans_total 1\n"));
@@ -157,6 +161,7 @@ mod tests {
         assert!(text.contains("# TYPE bf_seeders gauge\nbf_seeders 30\n"));
         assert!(text.contains("bf_leechers 12\n"));
         assert!(text.contains("bf_l7_tracked_sources 7\n"));
+        assert!(text.contains("# TYPE bf_l7_offenders gauge\nbf_l7_offenders 3\n"));
     }
 
     #[test]
@@ -191,7 +196,8 @@ mod tests {
                 torrents: 0,
                 seeders: 0,
                 leechers: 0,
-                l7_tracked: 0
+                l7_tracked: 0,
+                l7_offenders: 0
             }
         );
         assert!(format!("{g:?}").contains("Gauges"));

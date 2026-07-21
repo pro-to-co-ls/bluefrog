@@ -32,8 +32,10 @@ l7.max_entries 2000000         # memory bound on tracked sources
 #   ... ip saddr @l7ban4 drop ; ip6 saddr @l7ban6 drop
 nft.enable 1
 nft.table inet filter
-nft.set4 l7ban4
-nft.set6 l7ban6
+# One set per escalation tier, shortest-lived first. nft expires every element of a set on the
+# set's own clock, so tiers are what let a repeat offender be held longer than a first offender.
+nft.set4 l7ban4,l7ban4_24h,l7ban4_7d
+nft.set6 l7ban6,l7ban6_24h,l7ban6_7d
 
 # --- observability --------------------------------------------------------------------------
 metrics.listen 127.0.0.1:9100  # Prometheus/OpenMetrics endpoint (served to loopback only)

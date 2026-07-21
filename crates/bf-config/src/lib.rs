@@ -40,10 +40,10 @@ pub struct Config {
     pub nft_enable: bool,
     /// nft table for the ban sets.
     pub nft_table: String,
-    /// nft IPv4 ban set name.
-    pub nft_set4: String,
-    /// nft IPv6 ban set name.
-    pub nft_set6: String,
+    /// nft IPv4 ban set names, ordered shortest-lived first (one per escalation tier).
+    pub nft_set4: Vec<String>,
+    /// nft IPv6 ban set names, ordered shortest-lived first (one per escalation tier).
+    pub nft_set6: Vec<String>,
 }
 
 impl Default for Config {
@@ -62,8 +62,8 @@ impl Default for Config {
             l7: bf_l7::Config::default(),
             nft_enable: false,
             nft_table: "inet filter".to_string(),
-            nft_set4: "l7ban4".to_string(),
-            nft_set6: "l7ban6".to_string(),
+            nft_set4: vec!["l7ban4".to_string()],
+            nft_set6: vec!["l7ban6".to_string()],
         }
     }
 }
@@ -93,6 +93,15 @@ fn boolean(val: &str, line: usize) -> Result<bool, ParseError> {
             message: format!("expected a boolean, got {val:?}"),
         }),
     }
+}
+
+/// Parse a comma-separated nft set list: one set per escalation tier, shortest-lived first.
+fn set_list(val: &str) -> Vec<String> {
+    val.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Parse a listen address: `ip:port`, `[v6]:port`, or a bare address (which takes [`DEFAULT_PORT`]).
@@ -147,8 +156,8 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
             "l7.max_entries" => c.l7.max_entries = field(val, line)?,
             "nft.enable" => c.nft_enable = boolean(val, line)?,
             "nft.table" => c.nft_table = val.to_string(),
-            "nft.set4" => c.nft_set4 = val.to_string(),
-            "nft.set6" => c.nft_set6 = val.to_string(),
+            "nft.set4" => c.nft_set4 = set_list(val),
+            "nft.set6" => c.nft_set6 = set_list(val),
             // Unknown directives (accesslist, livesync, proxy, …) are ignored.
             _ => {}
         }
@@ -211,7 +220,7 @@ l7.ban_duration 7200
 l7.max_entries 500000
 nft.enable 1
 nft.table inet foo
-nft.set4 bans4
+nft.set4 bans4, bans4_24h ,bans4_7d
 nft.set6 bans6
 metrics.listen 127.0.0.1:9100
 ";
@@ -225,8 +234,9 @@ metrics.listen 127.0.0.1:9100
         assert_eq!(c.l7.max_entries, 500_000);
         assert!(c.nft_enable);
         assert_eq!(c.nft_table, "inet foo");
-        assert_eq!(c.nft_set4, "bans4");
-        assert_eq!(c.nft_set6, "bans6");
+        // a tier list is split and trimmed; a single name stays a one-tier list
+        assert_eq!(c.nft_set4, vec!["bans4", "bans4_24h", "bans4_7d"]);
+        assert_eq!(c.nft_set6, vec!["bans6"]);
         assert_eq!(c.metrics_listen, Some("127.0.0.1:9100".parse().unwrap()));
     }
 
@@ -256,9 +266,9 @@ metrics.listen 127.0.0.1:9100
 
     #[test]
     fn key_without_value_is_handled() {
-        // a bare key (no value) parses; string fields become empty
+        // a bare key (no value) parses; list fields become empty
         let c = parse("nft.set4\n").unwrap();
-        assert_eq!(c.nft_set4, "");
+        assert!(c.nft_set4.is_empty());
     }
 
     #[test]

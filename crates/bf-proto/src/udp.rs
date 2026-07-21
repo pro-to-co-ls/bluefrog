@@ -52,6 +52,14 @@ pub struct Announce<'a> {
     pub uploaded: u64,
     /// Decoded announce event.
     pub event: Event,
+    /// BEP-15 `IP address` field (offset 84). `0` means "use my source address"; the spec notes
+    /// trackers only honour it in limited circumstances, so a non-zero value from a publicly
+    /// routable source is a peer-list injection attempt rather than a NAT hint.
+    pub declared_ip: u32,
+    /// BEP-15 `key` field (offset 88): a client-chosen identifier that is meant to be random,
+    /// unique per client, and **stable across announces** — it exists so a client can prove its
+    /// identity when its IP changes. Churn or a trivial value is therefore an authenticity signal.
+    pub key: u32,
     /// Requested peer count (signed per BEP-15; `-1` means "tracker default").
     pub num_want: i32,
     /// The port the peer listens on.
@@ -143,6 +151,8 @@ pub fn parse(buf: &[u8]) -> Result<Request<'_>, ParseError> {
                 left: be_u64(&buf[64..72]),
                 uploaded: be_u64(&buf[72..80]),
                 event: Event::from_udp(be_u32(&buf[80..84])),
+                declared_ip: be_u32(&buf[84..88]),
+                key: be_u32(&buf[88..92]),
                 num_want: be_u32(&buf[92..96]) as i32,
                 port: be_u16(&buf[96..98]),
             }))
@@ -234,6 +244,8 @@ mod tests {
         p[64..72].copy_from_slice(&20u64.to_be_bytes());
         p[72..80].copy_from_slice(&30u64.to_be_bytes());
         p[80..84].copy_from_slice(&event.to_be_bytes());
+        p[84..88].copy_from_slice(&0x0a00_0001u32.to_be_bytes()); // declared IP field
+        p[88..92].copy_from_slice(&0xfeed_face_u32.to_be_bytes()); // key
         p[92..96].copy_from_slice(&(-1i32).to_be_bytes());
         p[96..98].copy_from_slice(&6881u16.to_be_bytes());
         p
@@ -296,6 +308,8 @@ mod tests {
             left: 20,
             uploaded: 30,
             event,
+            declared_ip: 0x0a00_0001,
+            key: 0xfeed_face,
             num_want: -1,
             port: 6881,
         })
