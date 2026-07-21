@@ -5,23 +5,35 @@
 //! workspace still builds and tests on a dev machine (production is linux arm64/amd64).
 //!
 //! rustables 0.8 has no per-element timeout, so auto-expiry comes from the **set's default
-//! `timeout`** — the firewall defines the sets as
-//! `set l7ban4 { type ipv4_addr; flags timeout; timeout <dur>; }` and added elements inherit it.
+//! `timeout`** — every element in a set therefore expires on the same clock. Escalation is built
+//! from that constraint rather than around it: the sink holds a *list* of sets per family, each
+//! declared by the firewall with a progressively longer timeout, e.g.
+//! `l7ban4` (1h), `l7ban4_24h`, `l7ban4_7d`. The detector's escalation tier selects which one a
+//! repeat offender lands in, so persistent sources stop getting a fresh short window.
 
 use std::net::IpAddr;
 
-/// Adds an offending source IP to the nft ban set.
+/// Adds an offending source IP to the nft ban set for its escalation tier.
 pub trait BanSink {
-    /// Ban `ip`. `duration` is informational — expiry is the set's default timeout.
+    /// Ban `ip` at escalation `tier` (clamped to the configured set list). `duration` is
+    /// informational — expiry is governed by the target set's own timeout.
     ///
     /// # Errors
     /// Returns a message if the netlink write fails (or, on non-Linux, always).
-    fn ban(&self, ip: IpAddr, duration: u32) -> Result<(), String>;
+    fn ban(&self, ip: IpAddr, tier: usize, duration: u32) -> Result<(), String>;
+}
+
+/// Pick the set for `tier`, clamping to the last configured tier.
+#[cfg(target_os = "linux")]
+fn tier_set(sets: &[String], tier: usize) -> Result<&str, String> {
+    sets.get(tier.min(sets.len().saturating_sub(1)))
+        .map(String::as_str)
+        .ok_or_else(|| "no nft ban set configured".to_string())
 }
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::BanSink;
+    use super::{BanSink, tier_set};
     use rustables::set::SetBuilder;
     use rustables::{Batch, MsgType, ProtocolFamily, Table};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -30,14 +42,15 @@ mod imp {
     pub struct NetlinkSink {
         family: ProtocolFamily,
         table: String,
-        set4: String,
-        set6: String,
+        sets4: Vec<String>,
+        sets6: Vec<String>,
     }
 
     impl NetlinkSink {
-        /// Build a sink for the given nft table spec (e.g. `"inet filter"`) and ban set names.
+        /// Build a sink for the given nft table spec (e.g. `"inet filter"`) and the per-tier ban
+        /// set names, ordered shortest-lived first.
         #[must_use]
-        pub fn new(table: &str, set4: String, set6: String) -> Self {
+        pub fn new(table: &str, sets4: Vec<String>, sets6: Vec<String>) -> Self {
             let mut parts = table.split_whitespace();
             let family = match parts.next() {
                 Some("ip") => ProtocolFamily::Ipv4,
@@ -48,24 +61,26 @@ mod imp {
             Self {
                 family,
                 table,
-                set4,
-                set6,
+                sets4,
+                sets6,
             }
         }
     }
 
     impl BanSink for NetlinkSink {
-        fn ban(&self, ip: IpAddr, _duration: u32) -> Result<(), String> {
+        fn ban(&self, ip: IpAddr, tier: usize, _duration: u32) -> Result<(), String> {
             let table = Table::new(self.family).with_name(self.table.clone());
             let elements = match ip {
                 IpAddr::V4(v4) => {
-                    let mut b = SetBuilder::<Ipv4Addr>::new(self.set4.clone(), &table)
+                    let set = tier_set(&self.sets4, tier)?;
+                    let mut b = SetBuilder::<Ipv4Addr>::new(set.to_string(), &table)
                         .map_err(|e| format!("{e:?}"))?;
                     b.add(&v4);
                     b.finish().1
                 }
                 IpAddr::V6(v6) => {
-                    let mut b = SetBuilder::<Ipv6Addr>::new(self.set6.clone(), &table)
+                    let set = tier_set(&self.sets6, tier)?;
+                    let mut b = SetBuilder::<Ipv6Addr>::new(set.to_string(), &table)
                         .map_err(|e| format!("{e:?}"))?;
                     b.add(&v6);
                     b.finish().1
@@ -89,13 +104,13 @@ mod imp {
     impl NetlinkSink {
         /// Construct the stub (arguments are ignored).
         #[must_use]
-        pub fn new(_table: &str, _set4: String, _set6: String) -> Self {
+        pub fn new(_table: &str, _sets4: Vec<String>, _sets6: Vec<String>) -> Self {
             Self
         }
     }
 
     impl BanSink for NetlinkSink {
-        fn ban(&self, _ip: IpAddr, _duration: u32) -> Result<(), String> {
+        fn ban(&self, _ip: IpAddr, _tier: usize, _duration: u32) -> Result<(), String> {
             Err("nft ban sink is only available on Linux".to_string())
         }
     }
