@@ -80,6 +80,7 @@ pub enum Verdict {
 struct Client {
     score: u32,
     last_seen: u32,
+    banned: bool,
     ring: [Option<(InfoHash, u32)>; RING],
     ring_pos: usize,
 }
@@ -89,6 +90,7 @@ impl Client {
         Self {
             score: 0,
             last_seen: now,
+            banned: false,
             ring: [None; RING],
             ring_pos: 0,
         }
@@ -140,12 +142,22 @@ impl Detector {
         &self.shards[usize::from(ip[15]) % SHARDS]
     }
 
-    fn verdict(&self, score: u32) -> Verdict {
-        if score >= self.config.score_ban_threshold {
-            Verdict::Ban {
-                duration: self.config.ban_duration,
+    /// Turn a client's current score into a verdict. A ban fires **once**, on the threshold
+    /// crossing, and is then suppressed until the score decays back below the threshold. Without
+    /// this, a sustained flood returns `Ban` on every packet from an already-banned IP and re-writes
+    /// it to the nft set each time — melting CPU (this is what produced 250M+ "bans").
+    fn verdict(&self, client: &mut Client) -> Verdict {
+        if client.score >= self.config.score_ban_threshold {
+            if client.banned {
+                Verdict::Allow
+            } else {
+                client.banned = true;
+                Verdict::Ban {
+                    duration: self.config.ban_duration,
+                }
             }
         } else {
+            client.banned = false;
             Verdict::Allow
         }
     }
@@ -183,7 +195,7 @@ impl Detector {
         if !is_known_client(peer_id) {
             client.score = client.score.saturating_add(self.config.weight_peerid);
         }
-        self.verdict(client.score)
+        self.verdict(client)
     }
 
     /// Feed a connection-id mismatch (a UDP announce/scrape whose connid failed validation).
@@ -191,7 +203,7 @@ impl Detector {
         let mut shard = self.shard(ip).lock();
         let client = self.touch(&mut shard, ip, now);
         client.score = client.score.saturating_add(self.config.weight_connid);
-        self.verdict(client.score)
+        self.verdict(client)
     }
 
     /// Number of currently-tracked sources (for a metrics gauge).
@@ -318,6 +330,48 @@ mod tests {
         d.on_announce(&a, &H1, &GOOD_PEER, 1000);
         d.on_announce(&b, &H1, &GOOD_PEER, 1001);
         assert_eq!(d.tracked(), 1); // only one survives in that shard
+    }
+
+    #[test]
+    fn ban_fires_once_then_suppressed_while_over_threshold() {
+        // A sustained flood must not re-ban (and re-write nft for) the same IP on every packet.
+        let d = Detector::new(Config {
+            weight_connid: 50,
+            decay_per_sec: 0,
+            score_ban_threshold: 100,
+            ..Config::default()
+        });
+        assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow); // 50
+        assert_eq!(
+            d.on_connid_mismatch(&IP, 1000),
+            Verdict::Ban { duration: 3600 } // 100 -> ban once
+        );
+        // still hammering, still over threshold: every subsequent hit is suppressed
+        for _ in 0..1000 {
+            assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow);
+        }
+    }
+
+    #[test]
+    fn rebans_after_score_decays_below_threshold() {
+        let d = Detector::new(Config {
+            weight_connid: 60,
+            decay_per_sec: 10,
+            score_ban_threshold: 100,
+            ..Config::default()
+        });
+        assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow); // 60
+        assert_eq!(
+            d.on_connid_mismatch(&IP, 1000),
+            Verdict::Ban { duration: 3600 } // 120 -> ban
+        );
+        // a long quiet gap decays the score away; the next low hit lands below the threshold,
+        // which re-arms the detector, and a further hit bans again
+        assert_eq!(d.on_connid_mismatch(&IP, 1100), Verdict::Allow); // decays to 0, then 60 (< 100)
+        assert_eq!(
+            d.on_connid_mismatch(&IP, 1100),
+            Verdict::Ban { duration: 3600 } // 120 -> bans again
+        );
     }
 
     #[test]

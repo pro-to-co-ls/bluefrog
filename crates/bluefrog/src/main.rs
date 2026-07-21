@@ -56,6 +56,20 @@ fn ip_to_16(ip: IpAddr) -> [u8; 16] {
     }
 }
 
+/// Canonicalize an address: a dual-stack `[::]` socket delivers IPv4 peers as IPv4-mapped IPv6
+/// (`::ffff:a.b.c.d`), so un-map them back to real IPv4. Without this, IPv4 clients are treated as
+/// v6 — stored in the v6 swarm and banned into the v6 nft set, where the `ip saddr @l7ban4` drop
+/// rule never matches them (and `ip6 saddr @l7ban6` can't match a v4 packet either).
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    }
+}
+
 fn random_key() -> [u8; 32] {
     std::array::from_fn(|_| fastrand::u8(..))
 }
@@ -77,12 +91,9 @@ fn bind_reuseport_udp(addr: SocketAddr, rcvbuf: Option<usize>) -> std::io::Resul
     UdpSocket::from_std(sock.into())
 }
 
-/// Feed the L7 detector from the datagram and the response we produced.
-fn feed_l7(sh: &Shared, req: &[u8], ip16: &[u8; 16], response: &[u8], now_min: u32) -> Verdict {
-    // A connection-id mismatch is an error reply (action 3).
-    if response.len() >= 4
-        && u32::from_be_bytes([response[0], response[1], response[2], response[3]]) == 3
-    {
+/// Feed the L7 detector from the datagram and the handler's verdict on it.
+fn feed_l7(sh: &Shared, req: &[u8], ip16: &[u8; 16], action: &Action, now_min: u32) -> Verdict {
+    if matches!(action, Action::ConnidMismatch) {
         return sh.detector.on_connid_mismatch(ip16, now_min);
     }
     if let Ok(udp::Request::Announce(a)) = udp::parse(req) {
@@ -101,9 +112,16 @@ fn ban(sh: &Shared, ip: IpAddr, duration: u32) {
 }
 
 fn record_udp_metric(metrics: &Metrics, req: &[u8], action: &Action) {
-    if matches!(action, Action::Drop) {
-        metrics.inc(Counter::UdpDropped);
-        return;
+    match action {
+        Action::Drop => {
+            metrics.inc(Counter::UdpDropped);
+            return;
+        }
+        Action::ConnidMismatch => {
+            metrics.inc(Counter::UdpConnidMismatch);
+            return;
+        }
+        Action::Reply(_) => {}
     }
     match udp::parse(req) {
         Ok(udp::Request::Connect { .. }) => metrics.inc(Counter::UdpConnect),
@@ -120,8 +138,9 @@ async fn udp_worker(sock: UdpSocket, sh: Arc<Shared>) {
         let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
             continue;
         };
-        let ip16 = ip_to_16(peer.ip());
-        let is_v4 = peer.is_ipv4();
+        let ip = canonical_ip(peer.ip());
+        let ip16 = ip_to_16(ip);
+        let is_v4 = ip.is_ipv4();
         let now = sh.clock.load(Ordering::Relaxed);
         let interval = 1620 + fastrand::u32(0..360);
         let action = sh
@@ -131,10 +150,10 @@ async fn udp_worker(sock: UdpSocket, sh: Arc<Shared>) {
         record_udp_metric(&sh.metrics, &buf[..n], &action);
         if sh.config.l7_enable {
             let now_min = u32::try_from(now / 60).unwrap_or(u32::MAX);
-            if let Verdict::Ban { duration } = feed_l7(&sh, &buf[..n], &ip16, &out, now_min) {
+            if let Verdict::Ban { duration } = feed_l7(&sh, &buf[..n], &ip16, &action, now_min) {
                 sh.metrics.inc(Counter::L7Ban);
                 if sh.config.nft_enable {
-                    ban(&sh, peer.ip(), duration);
+                    ban(&sh, ip, duration);
                 }
             }
         }
@@ -192,7 +211,7 @@ async fn serve_http(listener: TcpListener, sh: Arc<Shared>) {
             let io = TokioIo::new(stream);
             let service = service_fn(move |req: Request<Incoming>| {
                 let sh = sh.clone();
-                let ip = peer.ip();
+                let ip = canonical_ip(peer.ip());
                 let target = req
                     .uri()
                     .path_and_query()

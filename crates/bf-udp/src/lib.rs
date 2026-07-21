@@ -11,8 +11,6 @@ use std::sync::Arc;
 pub const NUMWANT_MAX_V4: usize = 200;
 /// UDP numwant cap for IPv6 clients.
 pub const NUMWANT_MAX_V6: usize = 66;
-/// Error string sent when a connection id fails validation.
-pub const CONNID_MISMATCH_MSG: &[u8] = b"Connection ID missmatch.";
 
 /// What the runtime should do with the datagram after handling.
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +19,9 @@ pub enum Action {
     Reply(usize),
     /// Silently drop the datagram (malformed, unknown, or denied).
     Drop,
+    /// Drop a datagram whose connection id failed validation. Distinct from [`Action::Drop`] so the
+    /// runtime can count it and feed the L7 detector — without sending a (backscatter) error reply.
+    ConnidMismatch,
 }
 
 /// Ties the store and connection-id scheme together for the UDP protocol.
@@ -88,7 +89,7 @@ impl Handler {
             }
             udp::Request::Announce(a) => {
                 if !self.connid.validate(a.connection_id, src_ip, now_secs) {
-                    return self.reply_connid_error(a.transaction_id, out);
+                    return Action::ConnidMismatch;
                 }
                 out.clear();
                 out.resize(20, 0); // reserve the header; the store appends peers after it
@@ -105,7 +106,7 @@ impl Handler {
             }
             udp::Request::Scrape(s) => {
                 if !self.connid.validate(s.connection_id, src_ip, now_secs) {
-                    return self.reply_connid_error(s.transaction_id, out);
+                    return Action::ConnidMismatch;
                 }
                 let entries: Vec<(u32, u32, u32)> = s
                     .iter_hashes()
@@ -120,13 +121,6 @@ impl Handler {
                 Action::Reply(n)
             }
         }
-    }
-
-    fn reply_connid_error(&self, transaction_id: u32, out: &mut Vec<u8>) -> Action {
-        out.clear();
-        out.resize(8 + CONNID_MISMATCH_MSG.len(), 0);
-        let n = udp::write_error(out, transaction_id, CONNID_MISMATCH_MSG);
-        Action::Reply(n)
     }
 
     /// Apply an announce to the store, leaving the compact peer bytes in `out`; returns counts.
@@ -230,14 +224,13 @@ mod tests {
     }
 
     #[test]
-    fn announce_bad_connid_returns_error() {
+    fn announce_bad_connid_drops() {
         let h = handler();
         let mut out = Vec::new();
         let pkt = announce(0xbad, 0x11, 0, 0, -1, 6881);
         let action = h.handle(&pkt, &V4_IP, true, 1000, 1800, &mut out);
-        assert_eq!(action, Action::Reply(8 + CONNID_MISMATCH_MSG.len()));
-        assert_eq!(&out[0..4], &3u32.to_be_bytes()); // error action
-        assert_eq!(&out[8..], CONNID_MISMATCH_MSG);
+        // bad connid: silent drop (no backscatter reply), flagged so the runtime counts/feeds L7
+        assert_eq!(action, Action::ConnidMismatch);
     }
 
     #[test]
@@ -325,15 +318,17 @@ mod tests {
         assert_eq!(&out[0..4], &2u32.to_be_bytes()); // scrape action
         assert_eq!(&out[8..12], &1u32.to_be_bytes()); // seeders
 
-        // scrape with a bad connection id -> error
+        // scrape with a bad connection id -> silent drop
         let bad = header(2, 0xbad, 0x9, MIN_PACKET + HASH_LEN);
         let a = h.handle(&bad, &V4_IP, true, now, 1800, &mut out);
-        assert_eq!(a, Action::Reply(8 + CONNID_MISMATCH_MSG.len()));
+        assert_eq!(a, Action::ConnidMismatch);
     }
 
     #[test]
     fn action_derives() {
         assert_ne!(Action::Reply(1), Action::Drop);
+        assert_ne!(Action::Drop, Action::ConnidMismatch);
         assert!(format!("{:?}", Action::Drop).contains("Drop"));
+        assert!(format!("{:?}", Action::ConnidMismatch).contains("ConnidMismatch"));
     }
 }
