@@ -16,11 +16,17 @@
 //! that rises with repeat offences, which the runtime maps onto progressively longer-lived nft
 //! sets. Pure logic (no I/O, no sockets), so every path is unit-testable.
 //!
-//! All times (`now`, [`Config::reannounce_min_interval`], `decay_per_sec`) are in **seconds**.
+//! All times (`now`, [`Config::reannounce_min_interval`], [`Config::decay_interval`]) are in
+//! **seconds**.
 #![forbid(unsafe_code)]
 
 use bf_core::{InfoHash, PeerId};
 use parking_lot::Mutex;
+
+/// Entries sampled when evicting from a full map. Scanning every entry for the true
+/// least-recently-seen is O(n) on the hot path — fatal once a map holds millions — so approximate
+/// it from a small sample instead.
+const EVICT_SAMPLE: usize = 8;
 
 /// Number of lock shards for the per-source state map.
 pub const SHARDS: usize = 16;
@@ -64,6 +70,9 @@ pub struct AnnounceInfo<'a> {
     /// Whether the *source* address is publicly routable. The `IP` field is only a legitimate NAT
     /// hint from private space, so this decides whether setting it is suspicious.
     pub source_is_public: bool,
+    /// Peers already in the swarm this announce joined. A real client joins swarms that have other
+    /// peers; a source that consistently announces into empty swarms is enumerating info-hashes.
+    pub swarm_peers: u32,
 }
 
 /// Tunables for the detector.
@@ -83,8 +92,13 @@ pub struct Config {
     pub weight_connid: u32,
     /// Score added when a peer_id matches no known client.
     pub weight_peerid: u32,
-    /// Score decayed per elapsed second since a source was last seen.
-    pub decay_per_sec: u32,
+    /// Score decayed per [`Config::decay_interval`] seconds of silence from a source.
+    pub decay_amount: u32,
+    /// Seconds that must pass before [`Config::decay_amount`] is subtracted. Decay has to be slow
+    /// relative to how often a source is *seen*, or a slow-but-wide flood can never accumulate: at
+    /// one point per second, a source observed every 11s loses 11 points between observations,
+    /// which erases every signal weighted below that.
+    pub decay_interval: u32,
     /// Score added for a trivial BEP-15 `key` (`0` or all-ones).
     pub weight_bad_key: u32,
     /// Score added when the `IP` field is set from a publicly routable source.
@@ -105,6 +119,11 @@ pub struct Config {
     pub weight_breadth: u32,
     /// Approximate distinct-torrent count that marks a source as enumerating the tracker.
     pub breadth_threshold: u32,
+    /// Score added once a source has announced into [`Config::empty_swarm_threshold`] consecutive
+    /// empty swarms.
+    pub weight_empty_swarm: u32,
+    /// Consecutive empty-swarm announces tolerated before a source is treated as enumerating.
+    pub empty_swarm_threshold: u32,
     /// Score added for a bulk scrape.
     pub weight_scrape_volume: u32,
     /// Info-hash count at or above which a scrape counts as bulk enumeration.
@@ -131,7 +150,8 @@ impl Default for Config {
             weight_interval: 20,
             weight_connid: 15,
             weight_peerid: 5,
-            decay_per_sec: 1,
+            decay_amount: 1,
+            decay_interval: 60,
             weight_bad_key: 40,
             weight_declared_ip: 60,
             weight_bad_port: 30,
@@ -142,11 +162,13 @@ impl Default for Config {
             numwant_abuse: 100,
             weight_breadth: 60,
             breadth_threshold: 32,
+            weight_empty_swarm: 40,
+            empty_swarm_threshold: 8,
             weight_scrape_volume: 15,
             scrape_volume_threshold: 32,
             weight_connect_spam: 25,
             connect_burst: 8,
-            max_offenders: 100_000,
+            max_offenders: 5_000_000,
             ban_tiers: 3,
         }
     }
@@ -180,11 +202,16 @@ struct Seen {
 struct Client {
     score: u32,
     last_seen: u32,
+    /// Anchor for decay, advanced only in whole [`Config::decay_interval`] steps so the remainder
+    /// is not silently lost each time the source is seen.
+    decay_at: u32,
     banned: bool,
     /// Bitmap fingerprint of the distinct torrents this source has touched.
     breadth: u64,
     /// Connection ids issued to this source that it has not yet used.
     connects: u32,
+    /// Consecutive announces that landed in an empty swarm.
+    empty_swarms: u32,
     ring: [Option<Seen>; RING],
     ring_pos: usize,
 }
@@ -209,17 +236,23 @@ impl Client {
         Self {
             score: 0,
             last_seen: now,
+            decay_at: now,
             banned: false,
             breadth: 0,
             connects: 0,
+            empty_swarms: 0,
             ring: [None; RING],
             ring_pos: 0,
         }
     }
 
-    fn decay(&mut self, now: u32, per_sec: u32) {
-        let elapsed = now.saturating_sub(self.last_seen);
-        self.score = self.score.saturating_sub(elapsed.saturating_mul(per_sec));
+    fn decay(&mut self, now: u32, amount: u32, interval: u32) {
+        let interval = interval.max(1);
+        let steps = now.saturating_sub(self.decay_at) / interval;
+        if steps > 0 {
+            self.score = self.score.saturating_sub(steps.saturating_mul(amount));
+            self.decay_at = self.decay_at.saturating_add(steps.saturating_mul(interval));
+        }
         self.last_seen = now;
     }
 
@@ -357,7 +390,11 @@ impl Detector {
         let mut reg = self.offenders.lock();
         if !reg.contains_key(ip)
             && reg.len() >= self.config.max_offenders
-            && let Some(oldest) = reg.iter().min_by_key(|(_, o)| o.last).map(|(k, _)| *k)
+            && let Some(oldest) = reg
+                .iter()
+                .take(EVICT_SAMPLE)
+                .min_by_key(|(_, o)| o.last)
+                .map(|(k, _)| *k)
         {
             reg.remove(&oldest);
         }
@@ -374,13 +411,14 @@ impl Detector {
             && shard.len() >= self.per_shard_cap
             && let Some(oldest) = shard
                 .iter()
+                .take(EVICT_SAMPLE)
                 .min_by_key(|(_, c)| c.last_seen)
                 .map(|(k, _)| *k)
         {
             shard.remove(&oldest);
         }
         let client = shard.entry(*ip).or_insert_with(|| Client::new(now));
-        client.decay(now, self.config.decay_per_sec);
+        client.decay(now, self.config.decay_amount, self.config.decay_interval);
         client
     }
 
@@ -407,6 +445,16 @@ impl Detector {
             }
             if !is_known_client(a.peer_id) {
                 add += self.config.weight_peerid;
+            }
+            // Announcing into a swarm nobody else is in, over and over, is enumeration rather
+            // than participation. Any real swarm resets the run, so power users are unaffected.
+            if a.swarm_peers <= 1 {
+                client.empty_swarms = client.empty_swarms.saturating_add(1);
+                if client.empty_swarms > self.config.empty_swarm_threshold {
+                    add += self.config.weight_empty_swarm;
+                }
+            } else {
+                client.empty_swarms = 0;
             }
             // A genuine peer participates in a bounded set of torrents.
             if client.widen(a.info_hash) >= self.config.breadth_threshold {
@@ -502,6 +550,7 @@ mod tests {
             uploaded: 5,
             num_want: 50,
             source_is_public: true,
+            swarm_peers: 5,
         }
     }
 
@@ -523,8 +572,9 @@ mod tests {
             weight_peerid_churn: 0,
             weight_numwant: 0,
             weight_breadth: 0,
+            weight_empty_swarm: 0,
             weight_scrape_volume: 0,
-            decay_per_sec: 0,
+            decay_amount: 0,
             ..Config::default()
         }
     }
@@ -746,7 +796,7 @@ mod tests {
     fn connid_mismatches_accumulate_to_a_ban() {
         let d = Detector::new(Config {
             weight_connid: 60,
-            decay_per_sec: 0,
+            decay_amount: 0,
             ..Config::default()
         });
         assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow);
@@ -760,7 +810,7 @@ mod tests {
     fn ban_fires_once_then_suppressed_while_over_threshold() {
         let d = Detector::new(Config {
             weight_connid: 50,
-            decay_per_sec: 0,
+            decay_amount: 0,
             ..Config::default()
         });
         assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow);
@@ -779,7 +829,8 @@ mod tests {
     fn score_decays_over_time() {
         let d = Detector::new(Config {
             weight_connid: 90,
-            decay_per_sec: 10,
+            decay_amount: 10,
+            decay_interval: 1,
             ..Config::default()
         });
         d.on_connid_mismatch(&IP, 1000); // 90
@@ -796,7 +847,8 @@ mod tests {
     fn rebans_after_score_decays_below_threshold() {
         let d = Detector::new(Config {
             weight_connid: 60,
-            decay_per_sec: 10,
+            decay_amount: 10,
+            decay_interval: 1,
             ..Config::default()
         });
         assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow);
@@ -820,7 +872,8 @@ mod tests {
         // the detector, followed by one that crosses — mirroring how a real source re-offends.
         let d = Detector::new(Config {
             weight_connid: 60,
-            decay_per_sec: 10,
+            decay_amount: 10,
+            decay_interval: 1,
             ban_tiers: 3,
             ..quiet()
         });
@@ -897,6 +950,62 @@ mod tests {
         // a scrape counts as follow-through too
         d.on_scrape(&IP, 1, 1000);
         assert_eq!(d.on_connect(&IP, 1000), Verdict::Allow);
+    }
+
+    #[test]
+    fn repeated_empty_swarms_score_but_a_real_swarm_resets() {
+        let d = Detector::new(Config {
+            weight_empty_swarm: 100,
+            empty_swarm_threshold: 3,
+            ..quiet()
+        });
+        let mut empty = clean(&H1, &GOOD_PEER);
+        empty.swarm_peers = 0;
+        for _ in 0..3 {
+            assert_eq!(d.on_announce(&IP, &empty, 1000), Verdict::Allow);
+        }
+        // joining a swarm that actually has peers clears the run, so power users are unaffected
+        let mut real = clean(&H1, &GOOD_PEER);
+        real.swarm_peers = 12;
+        assert_eq!(d.on_announce(&IP, &real, 1000), Verdict::Allow);
+        for _ in 0..3 {
+            assert_eq!(d.on_announce(&IP, &empty, 1000), Verdict::Allow);
+        }
+        // a sustained run of empty swarms is enumeration
+        assert!(matches!(
+            d.on_announce(&IP, &empty, 1000),
+            Verdict::Ban { .. }
+        ));
+    }
+
+    #[test]
+    fn decay_applies_only_in_whole_intervals() {
+        let d = Detector::new(Config {
+            weight_connid: 60,
+            decay_amount: 50,
+            decay_interval: 60,
+            ..quiet()
+        });
+        assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow); // 60
+        // 30s is under one interval, so nothing decays and this crosses the threshold. Under the
+        // old per-second decay a source seen this often could never accumulate at all.
+        assert!(matches!(
+            d.on_connid_mismatch(&IP, 1030),
+            Verdict::Ban { .. }
+        ));
+    }
+
+    #[test]
+    fn whole_intervals_of_silence_decay_the_score() {
+        let d = Detector::new(Config {
+            weight_connid: 60,
+            decay_amount: 50,
+            decay_interval: 60,
+            ..quiet()
+        });
+        d.on_connid_mismatch(&IP, 1000); // 60
+        // two whole intervals later the score has decayed away, so 60 is under the threshold again
+        assert_eq!(d.on_connid_mismatch(&IP, 1130), Verdict::Allow);
     }
 
     #[test]

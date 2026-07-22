@@ -125,6 +125,7 @@ fn feed_l7(
     ip: IpAddr,
     ip16: &[u8; 16],
     action: &Action,
+    out: &[u8],
     now_secs: u32,
 ) -> Verdict {
     if matches!(action, Action::ConnidMismatch) {
@@ -143,6 +144,14 @@ fn feed_l7(
                 uploaded: a.uploaded,
                 num_want: a.num_want,
                 source_is_public: is_public(ip),
+                // The announce reply carries the swarm counts (BEP-15: leechers at 12, seeders
+                // at 16). An empty swarm means this info-hash has no other participants.
+                swarm_peers: if out.len() >= 20 {
+                    u32::from_be_bytes([out[12], out[13], out[14], out[15]])
+                        .saturating_add(u32::from_be_bytes([out[16], out[17], out[18], out[19]]))
+                } else {
+                    0
+                },
             };
             sh.detector.on_announce(ip16, &info, now_secs)
         }
@@ -213,7 +222,7 @@ async fn udp_worker(sock: UdpSocket, sh: Arc<Shared>) {
             // `decay_per_sec` are in seconds), unlike the store's minutes clock.
             let now_secs = u32::try_from(now).unwrap_or(u32::MAX);
             if let Verdict::Ban { duration, tier } =
-                feed_l7(&sh, &parsed, ip, &ip16, &action, now_secs)
+                feed_l7(&sh, &parsed, ip, &ip16, &action, &out, now_secs)
             {
                 sh.metrics.inc(Counter::L7Ban);
                 if sh.config.nft_enable {
