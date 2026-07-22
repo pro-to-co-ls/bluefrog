@@ -154,6 +154,7 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
             "l7.score_ban_threshold" => c.l7.score_ban_threshold = field(val, line)?,
             "l7.ban_duration" => c.l7.ban_duration = field(val, line)?,
             "l7.max_entries" => c.l7.max_entries = field(val, line)?,
+            "l7.max_offenders" => c.l7.max_offenders = field(val, line)?,
             "nft.enable" => c.nft_enable = boolean(val, line)?,
             "nft.table" => c.nft_table = val.to_string(),
             "nft.set4" => c.nft_set4 = set_list(val),
@@ -218,6 +219,7 @@ l7.reannounce_min_interval 30
 l7.score_ban_threshold 200
 l7.ban_duration 7200
 l7.max_entries 500000
+l7.max_offenders 4000000
 nft.enable 1
 nft.table inet foo
 nft.set4 bans4, bans4_24h ,bans4_7d
@@ -232,6 +234,7 @@ metrics.listen 127.0.0.1:9100
         assert_eq!(c.l7.score_ban_threshold, 200);
         assert_eq!(c.l7.ban_duration, 7200);
         assert_eq!(c.l7.max_entries, 500_000);
+        assert_eq!(c.l7.max_offenders, 4_000_000);
         assert!(c.nft_enable);
         assert_eq!(c.nft_table, "inet foo");
         // a tier list is split and trimmed; a single name stays a one-tier list

@@ -22,6 +22,7 @@ l7.reannounce_min_interval 60  # same-torrent re-announce faster than this = a v
 l7.score_ban_threshold 100
 l7.ban_duration 3600           # informational; expiry is the nft set's default timeout
 l7.max_entries 2000000         # memory bound on tracked sources
+l7.max_offenders 5000000       # escalation registry; sampled eviction, ~48 bytes/entry
 
 # --- nft enforcement (native netlink; auto-expiring ban sets) ------------------------------
 # Bans are written directly over netlink (no process spawn); needs CAP_NET_ADMIN (see
