@@ -225,6 +225,9 @@ async fn udp_worker(sock: UdpSocket, sh: Arc<Shared>) {
                 feed_l7(&sh, &parsed, ip, &ip16, &action, &out, now_secs)
             {
                 sh.metrics.inc(Counter::L7Ban);
+                if tier > 0 {
+                    sh.metrics.inc(Counter::L7BanEscalated);
+                }
                 if sh.config.nft_enable {
                     ban(sh.clone(), ip, tier as usize, duration);
                 }
@@ -432,5 +435,14 @@ async fn main() -> std::io::Result<()> {
             format!("{path}:{}: {}", e.line, e.message),
         )
     })?;
+    if !config.unknown.is_empty() {
+        // Almost always a config templated for a newer bluefrog than this binary: the setting
+        // looks applied but silently is not.
+        eprintln!(
+            "bluefrog: WARNING {} unrecognised config directive(s), ignored: {}",
+            config.unknown.len(),
+            config.unknown.join(", ")
+        );
+    }
     run(config).await
 }

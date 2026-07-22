@@ -138,6 +138,16 @@ pub struct Config {
     pub max_offenders: usize,
     /// Number of escalation tiers; tier `0` is the first offence.
     pub ban_tiers: u32,
+    /// Seconds a ban suppresses further bans for the same source. Re-arming is deliberately
+    /// **time**-driven, not score-driven: keying it off the score meant a source whose score
+    /// stayed above the threshold was never re-banned after its nft entry expired, so it could
+    /// never escalate either.
+    pub reban_cooldown: u32,
+    /// Inter-arrival gap below which a source counts as announcing "fast". Behavioural signals
+    /// only score under this gap: an honest low-activity seeder shows the same *shapes* as a
+    /// flood (empty swarms, seeding without transfer, many torrents) but does so slowly, so rate
+    /// is the only thing that actually separates them.
+    pub fast_announce_gap: u32,
 }
 
 impl Default for Config {
@@ -169,7 +179,9 @@ impl Default for Config {
             weight_connect_spam: 25,
             connect_burst: 8,
             max_offenders: 5_000_000,
-            ban_tiers: 3,
+            ban_tiers: 4,
+            reban_cooldown: 3600,
+            fast_announce_gap: 300,
         }
     }
 }
@@ -205,7 +217,10 @@ struct Client {
     /// Anchor for decay, advanced only in whole [`Config::decay_interval`] steps so the remainder
     /// is not silently lost each time the source is seen.
     decay_at: u32,
-    banned: bool,
+    /// Time until which further bans for this source are suppressed.
+    banned_until: u32,
+    /// Seconds since this source was previously seen.
+    last_gap: u32,
     /// Bitmap fingerprint of the distinct torrents this source has touched.
     breadth: u64,
     /// Connection ids issued to this source that it has not yet used.
@@ -237,7 +252,8 @@ impl Client {
             score: 0,
             last_seen: now,
             decay_at: now,
-            banned: false,
+            banned_until: 0,
+            last_gap: u32::MAX,
             breadth: 0,
             connects: 0,
             empty_swarms: 0,
@@ -247,6 +263,7 @@ impl Client {
     }
 
     fn decay(&mut self, now: u32, amount: u32, interval: u32) {
+        self.last_gap = now.saturating_sub(self.last_seen);
         let interval = interval.max(1);
         let steps = now.saturating_sub(self.decay_at) / interval;
         if steps > 0 {
@@ -329,7 +346,7 @@ impl Detector {
 
     /// Single-packet checks that need no per-source state: each is a direct contradiction of what
     /// the tracker protocol says a well-behaved client does.
-    fn stateless_score(&self, a: &AnnounceInfo) -> u32 {
+    fn stateless_score(&self, a: &AnnounceInfo, fast: bool) -> u32 {
         let c = &self.config;
         let mut score = 0;
         // A real client randomises `key`; crude flood tools leave it at a trivial constant.
@@ -340,16 +357,18 @@ impl Detector {
         if a.declared_ip != 0 && a.source_is_public {
             score += c.weight_declared_ip;
         }
-        // A peer nobody can connect to is not participating in the swarm.
-        if a.port < 1024 {
+        // A peer nobody can connect to is not participating in the swarm. Gated: some clients
+        // legitimately listen on 443/80 to get past ISP filtering.
+        if fast && a.port < 1024 {
             score += c.weight_bad_port;
         }
-        // Claims a complete copy while never having transferred a byte.
-        if a.left == 0 && a.downloaded == 0 && a.uploaded == 0 {
+        // Claims a complete copy while never having transferred a byte. Gated: this is exactly
+        // what a client reports when you add a torrent for files you already have.
+        if fast && a.left == 0 && a.downloaded == 0 && a.uploaded == 0 {
             score += c.weight_fake_seeder;
         }
         // "Even 30 peers is plenty" - demanding far more is harvesting, not downloading.
-        if a.num_want > c.numwant_abuse {
+        if fast && a.num_want > c.numwant_abuse {
             score += c.weight_numwant;
         }
         score
@@ -358,18 +377,15 @@ impl Detector {
     /// Whether this observation crosses into a ban. Fires **once** per offence: while the source
     /// stays over the threshold further packets are suppressed, otherwise a sustained flood would
     /// re-ban (and re-write nft for) the same IP on every packet.
-    fn crosses(&self, client: &mut Client) -> bool {
-        if client.score >= self.config.score_ban_threshold {
-            if client.banned {
-                false
-            } else {
-                client.banned = true;
-                true
-            }
-        } else {
-            client.banned = false;
-            false
+    fn crosses(&self, client: &mut Client, now: u32) -> bool {
+        if client.score < self.config.score_ban_threshold {
+            return false;
         }
+        if now < client.banned_until {
+            return false; // still inside the ban we already issued
+        }
+        client.banned_until = now.saturating_add(self.config.reban_cooldown);
+        true
     }
 
     /// Turn a ban decision into a verdict, escalating on repeat offences.
@@ -407,6 +423,7 @@ impl Detector {
     /// Insert-or-get the client for `ip`, evicting the least-recently-seen entry if the shard is
     /// at capacity. Applies score decay before returning.
     fn touch<'a>(&self, shard: &'a mut Shard, ip: &Ip, now: u32) -> &'a mut Client {
+        let first_sighting = !shard.contains_key(ip);
         if !shard.contains_key(ip)
             && shard.len() >= self.per_shard_cap
             && let Some(oldest) = shard
@@ -419,13 +436,17 @@ impl Detector {
         }
         let client = shard.entry(*ip).or_insert_with(|| Client::new(now));
         client.decay(now, self.config.decay_amount, self.config.decay_interval);
+        if first_sighting {
+            // No inter-arrival history yet, so this must not be treated as a fast announcer.
+            client.last_gap = u32::MAX;
+        }
         client
     }
 
     /// Feed an announce. `now` is in **seconds**.
     pub fn on_announce(&self, ip: &Ip, a: &AnnounceInfo, now: u32) -> Verdict {
         let peer = peer_fingerprint(a.peer_id);
-        let stateless = self.stateless_score(a);
+
         let ban = {
             let mut shard = self.shard(ip).lock();
             let client = self.touch(&mut shard, ip, now);
@@ -433,7 +454,12 @@ impl Detector {
             client.connects = 0;
             let (interval, key_churn, peer_churn) =
                 client.observe(a, now, self.config.reannounce_min_interval, peer);
-            let mut add = stateless;
+            // Behavioural signals only count when this source is announcing far faster than the
+            // interval we advertise. Without this gate an honest seeder of an unpopular torrent,
+            // or of files it already had, trips the same checks - just over hours instead of
+            // seconds.
+            let fast = client.last_gap < self.config.fast_announce_gap;
+            let mut add = self.stateless_score(a, fast);
             if interval {
                 add += self.config.weight_interval;
             }
@@ -448,7 +474,7 @@ impl Detector {
             }
             // Announcing into a swarm nobody else is in, over and over, is enumeration rather
             // than participation. Any real swarm resets the run, so power users are unaffected.
-            if a.swarm_peers <= 1 {
+            if fast && a.swarm_peers <= 1 {
                 client.empty_swarms = client.empty_swarms.saturating_add(1);
                 if client.empty_swarms > self.config.empty_swarm_threshold {
                     add += self.config.weight_empty_swarm;
@@ -457,11 +483,11 @@ impl Detector {
                 client.empty_swarms = 0;
             }
             // A genuine peer participates in a bounded set of torrents.
-            if client.widen(a.info_hash) >= self.config.breadth_threshold {
+            if fast && client.widen(a.info_hash) >= self.config.breadth_threshold {
                 add += self.config.weight_breadth;
             }
             client.score = client.score.saturating_add(add);
-            self.crosses(client)
+            self.crosses(client, now)
         };
         self.decide(ip, ban, now)
     }
@@ -473,7 +499,7 @@ impl Detector {
             let mut shard = self.shard(ip).lock();
             let client = self.touch(&mut shard, ip, now);
             client.score = client.score.saturating_add(self.config.weight_connid);
-            self.crosses(client)
+            self.crosses(client, now)
         };
         self.decide(ip, ban, now)
     }
@@ -491,7 +517,7 @@ impl Detector {
                     .score
                     .saturating_add(self.config.weight_scrape_volume);
             }
-            self.crosses(client)
+            self.crosses(client, now)
         };
         self.decide(ip, ban, now)
     }
@@ -509,7 +535,7 @@ impl Detector {
             if client.connects > self.config.connect_burst {
                 client.score = client.score.saturating_add(self.config.weight_connect_spam);
             }
-            self.crosses(client)
+            self.crosses(client, now)
         };
         self.decide(ip, ban, now)
     }
@@ -645,6 +671,7 @@ mod tests {
         });
         let mut a = clean(&H1, &GOOD_PEER);
         a.port = 0;
+        assert_eq!(d.on_announce(&IP, &a, 1000), Verdict::Allow);
         assert!(matches!(d.on_announce(&IP, &a, 1000), Verdict::Ban { .. }));
     }
 
@@ -658,6 +685,8 @@ mod tests {
         a.left = 0;
         a.downloaded = 0;
         a.uploaded = 0;
+        // the first sighting has no rate history, so the gated signal only counts from the second
+        assert_eq!(d.on_announce(&IP, &a, 1000), Verdict::Allow);
         assert!(matches!(d.on_announce(&IP, &a, 1000), Verdict::Ban { .. }));
     }
 
@@ -669,6 +698,7 @@ mod tests {
         });
         let mut a = clean(&H1, &GOOD_PEER);
         a.num_want = 5000;
+        assert_eq!(d.on_announce(&IP, &a, 1000), Verdict::Allow);
         assert!(matches!(d.on_announce(&IP, &a, 1000), Verdict::Ban { .. }));
     }
 
@@ -844,50 +874,83 @@ mod tests {
     }
 
     #[test]
-    fn rebans_after_score_decays_below_threshold() {
+    fn rebans_after_the_cooldown_even_with_a_high_score() {
+        // Regression: re-arming used to require the score to fall back below the threshold, so a
+        // source whose score stayed high was never re-banned once its nft entry expired - and so
+        // could never escalate. Re-arming is now purely time-driven.
         let d = Detector::new(Config {
-            weight_connid: 60,
-            decay_amount: 10,
-            decay_interval: 1,
-            ..Config::default()
+            weight_connid: 500, // score rockets past the threshold...
+            decay_amount: 0,    // ...and never comes back down
+            reban_cooldown: 100,
+            ..quiet()
         });
-        assert_eq!(d.on_connid_mismatch(&IP, 1000), Verdict::Allow);
         assert!(matches!(
             d.on_connid_mismatch(&IP, 1000),
             Verdict::Ban { tier: 0, .. }
         ));
-        assert_eq!(d.on_connid_mismatch(&IP, 1100), Verdict::Allow);
-        // second offence escalates a tier
+        // inside the cooldown the ban is suppressed
+        assert_eq!(d.on_connid_mismatch(&IP, 1050), Verdict::Allow);
+        // past it the source is re-banned and escalated, despite the score never dropping
         assert!(matches!(
-            d.on_connid_mismatch(&IP, 1100),
+            d.on_connid_mismatch(&IP, 1101),
             Verdict::Ban { tier: 1, .. }
         ));
     }
 
-    // --- escalation ----------------------------------------------------------------------------
-
     #[test]
     fn repeat_offences_escalate_then_cap() {
-        // The weight sits below the threshold so each round has a sub-threshold hit that re-arms
-        // the detector, followed by one that crosses — mirroring how a real source re-offends.
         let d = Detector::new(Config {
-            weight_connid: 60,
-            decay_amount: 10,
-            decay_interval: 1,
-            ban_tiers: 3,
+            weight_connid: 500,
+            decay_amount: 0,
+            reban_cooldown: 100,
+            ban_tiers: 4,
             ..quiet()
         });
         let mut tiers = Vec::new();
-        for round in 0..5u32 {
-            let now = 1000 + round * 100; // a long gap decays the previous score away
-            d.on_connid_mismatch(&IP, now); // 60 -> under threshold, re-arms
+        for round in 0..6u32 {
+            let now = 1000 + round * 101; // each round clears the cooldown
             if let Verdict::Ban { tier, .. } = d.on_connid_mismatch(&IP, now) {
                 tiers.push(tier);
             }
         }
-        // first offence is tier 0, escalating one tier per ban, capped at ban_tiers - 1
-        assert_eq!(tiers, vec![0, 1, 2, 2, 2]);
+        // first offence is tier 0, one tier per ban, capped at ban_tiers - 1
+        assert_eq!(tiers, vec![0, 1, 2, 3, 3, 3]);
         assert_eq!(d.offenders(), 1);
+    }
+
+    #[test]
+    fn an_honest_slow_seeder_is_never_flagged() {
+        // Empty swarm, left=0 with nothing transferred, unconnectable-looking port: exactly the
+        // shape of the flood, but produced by someone seeding an unpopular torrent of files they
+        // already had - at the interval we advertise.
+        let cfg = Config {
+            weight_empty_swarm: 100,
+            weight_fake_seeder: 100,
+            weight_bad_port: 100,
+            empty_swarm_threshold: 2,
+            fast_announce_gap: 300,
+            ..quiet()
+        };
+        let d = Detector::new(cfg);
+        let mut honest = clean(&H1, &GOOD_PEER);
+        honest.swarm_peers = 0;
+        honest.left = 0;
+        honest.downloaded = 0;
+        honest.uploaded = 0;
+        honest.port = 443;
+        for round in 0..12u32 {
+            let now = 1000 + round * 1800; // every 30 minutes, as instructed
+            assert_eq!(d.on_announce(&IP, &honest, now), Verdict::Allow);
+        }
+        // the identical shape at flood speed is caught
+        let d2 = Detector::new(cfg);
+        let caught = (0..12u32).any(|r| {
+            matches!(
+                d2.on_announce(&IP, &honest, 1000 + r * 5),
+                Verdict::Ban { .. }
+            )
+        });
+        assert!(caught, "the same shape at flood rate must be caught");
     }
 
     #[test]
