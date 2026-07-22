@@ -44,6 +44,11 @@ pub struct Config {
     pub nft_set4: Vec<String>,
     /// nft IPv6 ban set names, ordered shortest-lived first (one per escalation tier).
     pub nft_set6: Vec<String>,
+    /// Directives this build does not recognise. They are still ignored (opentracker configs
+    /// carry accesslist/livesync keys we have no use for), but the runtime reports them: a config
+    /// templated for a newer bluefrog than the binary that reads it would otherwise apply
+    /// silently-nothing, which is indistinguishable from working.
+    pub unknown: Vec<String>,
 }
 
 impl Default for Config {
@@ -64,6 +69,7 @@ impl Default for Config {
             nft_table: "inet filter".to_string(),
             nft_set4: vec!["l7ban4".to_string()],
             nft_set6: vec!["l7ban6".to_string()],
+            unknown: Vec::new(),
         }
     }
 }
@@ -155,12 +161,15 @@ pub fn parse(text: &str) -> Result<Config, ParseError> {
             "l7.ban_duration" => c.l7.ban_duration = field(val, line)?,
             "l7.max_entries" => c.l7.max_entries = field(val, line)?,
             "l7.max_offenders" => c.l7.max_offenders = field(val, line)?,
+            "l7.reban_cooldown" => c.l7.reban_cooldown = field(val, line)?,
+            "l7.fast_announce_gap" => c.l7.fast_announce_gap = field(val, line)?,
             "nft.enable" => c.nft_enable = boolean(val, line)?,
             "nft.table" => c.nft_table = val.to_string(),
             "nft.set4" => c.nft_set4 = set_list(val),
             "nft.set6" => c.nft_set6 = set_list(val),
-            // Unknown directives (accesslist, livesync, proxy, …) are ignored.
-            _ => {}
+            // Unknown directives (accesslist, livesync, proxy, …) are ignored, but recorded so
+            // the runtime can say so out loud.
+            other => c.unknown.push(other.to_string()),
         }
     }
     Ok(c)
@@ -172,9 +181,15 @@ mod tests {
 
     #[test]
     fn defaults_and_comments_and_unknown() {
-        let c =
+        let mut c =
             parse("# a comment\n\n   \naccess.whitelist /x\nlivesync.cluster.node_ip 1.2.3.4\n")
                 .unwrap();
+        // unrecognised keys are ignored, but surfaced rather than swallowed
+        assert_eq!(
+            c.unknown,
+            vec!["access.whitelist", "livesync.cluster.node_ip"]
+        );
+        c.unknown.clear();
         assert_eq!(c, Config::default());
         assert_eq!(c.connid_window, 120);
         assert!(c.udp_listen.is_empty());
@@ -220,6 +235,8 @@ l7.score_ban_threshold 200
 l7.ban_duration 7200
 l7.max_entries 500000
 l7.max_offenders 4000000
+l7.reban_cooldown 900
+l7.fast_announce_gap 120
 nft.enable 1
 nft.table inet foo
 nft.set4 bans4, bans4_24h ,bans4_7d
@@ -235,6 +252,8 @@ metrics.listen 127.0.0.1:9100
         assert_eq!(c.l7.ban_duration, 7200);
         assert_eq!(c.l7.max_entries, 500_000);
         assert_eq!(c.l7.max_offenders, 4_000_000);
+        assert_eq!(c.l7.reban_cooldown, 900);
+        assert_eq!(c.l7.fast_announce_gap, 120);
         assert!(c.nft_enable);
         assert_eq!(c.nft_table, "inet foo");
         // a tier list is split and trimmed; a single name stays a one-tier list

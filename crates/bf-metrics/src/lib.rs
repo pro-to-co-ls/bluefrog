@@ -30,6 +30,8 @@ pub struct Metrics {
     pub l7_flagged: AtomicU64,
     /// Sources banned into the nft set by the L7 layer.
     pub l7_bans: AtomicU64,
+    /// Bans issued above tier 0 — i.e. repeat offenders that actually escalated.
+    pub l7_bans_escalated: AtomicU64,
     /// nft writer errors.
     pub nft_errors: AtomicU64,
 }
@@ -57,6 +59,8 @@ pub enum Counter {
     L7Flagged,
     /// [`Metrics::l7_bans`].
     L7Ban,
+    /// [`Metrics::l7_bans_escalated`].
+    L7BanEscalated,
     /// [`Metrics::nft_errors`].
     NftError,
 }
@@ -100,6 +104,7 @@ impl Metrics {
             Counter::Error => &self.errors,
             Counter::L7Flagged => &self.l7_flagged,
             Counter::L7Ban => &self.l7_bans,
+            Counter::L7BanEscalated => &self.l7_bans_escalated,
             Counter::NftError => &self.nft_errors,
         }
     }
@@ -118,6 +123,7 @@ impl Metrics {
             ("bf_errors_total", Counter::Error),
             ("bf_l7_flagged_total", Counter::L7Flagged),
             ("bf_l7_bans_total", Counter::L7Ban),
+            ("bf_l7_bans_escalated_total", Counter::L7BanEscalated),
             ("bf_nft_errors_total", Counter::NftError),
         ];
         let mut out = String::new();
@@ -157,6 +163,7 @@ mod tests {
         });
         assert!(text.contains("# TYPE bf_udp_announces_total counter\nbf_udp_announces_total 2\n"));
         assert!(text.contains("bf_l7_bans_total 1\n"));
+        assert!(text.contains("bf_l7_bans_escalated_total 0\n"));
         assert!(text.contains("# TYPE bf_torrents gauge\nbf_torrents 42\n"));
         assert!(text.contains("# TYPE bf_seeders gauge\nbf_seeders 30\n"));
         assert!(text.contains("bf_leechers 12\n"));
@@ -178,6 +185,7 @@ mod tests {
             Counter::Error,
             Counter::L7Flagged,
             Counter::L7Ban,
+            Counter::L7BanEscalated,
             Counter::NftError,
         ] {
             m.inc(c);
